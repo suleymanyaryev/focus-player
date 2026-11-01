@@ -1,0 +1,35 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node (e.g. if served with `npx serve`)
+node_modules/
+npm-debug.log*
+
+# Python (e.g. `python3 -m http.server`)
+__pycache__/
+
+# Environment / secrets
+.env
+.env.*
+
+# Deploy tooling
+.vercel/
+.netlify/
+.wrangler/
+
+# Logs
+*.log
