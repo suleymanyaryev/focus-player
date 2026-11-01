@@ -235,23 +235,41 @@
       box-shadow: var(--shadow);
     }
     .player iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+    .player:fullscreen { aspect-ratio: auto; width: 100%; height: 100%; max-height: none; border-radius: 0; }
 
-    .ended {
+    /* Our own screens on top of / instead of the YouTube player (paused, ended) */
+    .overlay {
       position: absolute;
       inset: 0;
+      z-index: 1;
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
       gap: 6px;
       padding: 16px;
+      overflow: hidden;
       background: radial-gradient(circle at center, #1d2523, #0b0d0c);
       color: #e9ebe8;
       text-align: center;
     }
-    .ended .title { margin: 0; font-size: 18px; font-weight: 620; }
-    .ended .sub { margin: 0 0 12px; color: #9aa19d; font-size: 14px; }
-    .ended .actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+    .overlay[style*="--thumb"]::before {
+      content: "";
+      position: absolute;
+      inset: -40px;
+      z-index: -1;
+      background: linear-gradient(rgba(8, 10, 9, 0.62), rgba(8, 10, 9, 0.78)), var(--thumb) center / cover;
+      filter: blur(18px);
+    }
+    .paused { cursor: pointer; }
+    .overlay .title { margin: 0; font-size: 18px; font-weight: 620; }
+    .overlay .sub { margin: 0 0 12px; color: #b5bbb7; font-size: 14px; font-variant-numeric: tabular-nums; }
+    .overlay .actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+    @media (max-width: 600px) {
+      .overlay { gap: 2px; }
+      .overlay .title { font-size: 16px; }
+      .overlay .sub { margin-bottom: 8px; }
+    }
     .ghost {
       display: inline-flex;
       align-items: center;
@@ -265,7 +283,7 @@
       font-weight: 560;
     }
     .ghost:hover { background: rgba(255, 255, 255, 0.08); }
-    .ended .primary { height: 44px; background: #5cc0a3; color: #08130f; box-shadow: none; }
+    .overlay .primary { height: 44px; background: #5cc0a3; color: #08130f; box-shadow: none; }
 
     /* ---------- Info bar under the player ---------- */
     .bar {
@@ -576,19 +594,27 @@
       return `https://www.youtube-nocookie.com/embed/${id}?${p}`;
     }
 
+    let iframe = null;    // the live YouTube iframe, if any
+    let lastTime = 0;     // seconds, reported by the player while it plays
+    let duration = 0;
+    let pauseTimer = null;
+
     function load(video, { autoplay = true, push = true } = {}) {
       current = video;
+      lastTime = 0;
+      duration = 0;
+      clearTimeout(pauseTimer);
       clearError();
       empty.hidden = true;
       stage.hidden = false;
 
-      const iframe = document.createElement('iframe');
+      iframe = document.createElement('iframe');
       iframe.src = embedUrl(video, autoplay);
       iframe.title = 'YouTube video player';
       iframe.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen';
       iframe.allowFullscreen = true;
       iframe.referrerPolicy = 'strict-origin-when-cross-origin';
-      iframe.addEventListener('load', () => listenForEnd(iframe));
+      iframe.addEventListener('load', subscribe);
       player.replaceChildren(iframe);
 
       if (push) {
@@ -599,30 +625,102 @@
       loadMeta(video.id);
     }
 
-    // Subscribe to player state over postMessage (no youtube.com script needed).
-    // When the video ends, swap the player out so YouTube's end-screen suggestions never show.
-    function listenForEnd(iframe) {
-      const send = msg => iframe.contentWindow?.postMessage(JSON.stringify(msg), '*');
-      send({ event: 'listening', id: 'focus-player', channel: 'widget' });
-      send({ event: 'command', func: 'addEventListener', args: ['onStateChange'], id: 'focus-player', channel: 'widget' });
+    // Talk to the player over postMessage (the protocol the IFrame API uses),
+    // so no script from youtube.com is needed.
+    function send(msg) {
+      iframe?.contentWindow?.postMessage(JSON.stringify({ ...msg, id: 'focus-player', channel: 'widget' }), '*');
+    }
+    function command(func, args = []) {
+      send({ event: 'command', func, args });
+    }
+    function subscribe() {
+      send({ event: 'listening' });
+      command('addEventListener', ['onStateChange']);
     }
 
     window.addEventListener('message', e => {
       let host;
       try { host = new URL(e.origin).hostname; } catch { return; }
-      if (!/youtube(-nocookie)?\.com$/.test(host)) return;
+      if (!/youtube(-nocookie)?\.com$/.test(host) || e.source !== iframe?.contentWindow) return;
       let data;
       try { data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch { return; }
-      const ended =
-        (data.event === 'onStateChange' && data.info === 0) ||
-        (data.event === 'infoDelivery' && data.info && data.info.playerState === 0);
-      if (ended) showEnded();
+      if (data.event === 'onStateChange') onState(data.info);
+      if (data.event === 'infoDelivery' && data.info) {
+        if (typeof data.info.currentTime === 'number') lastTime = data.info.currentTime;
+        if (data.info.duration) duration = data.info.duration;
+        if ('playerState' in data.info) onState(data.info.playerState);
+      }
     });
+
+    // YouTube player states: -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
+    function onState(state) {
+      clearTimeout(pauseTimer);
+      if (state === 0) {
+        showEnded();
+      } else if (state === 2) {
+        // Short delay so quick pauses while seeking don't flash the cover.
+        pauseTimer = setTimeout(showPaused, 200);
+      } else if (state === 1 || state === 3) {
+        hidePaused();
+      }
+    }
+
+    // While paused, cover the player so YouTube's "More videos" strip never shows.
+    function showPaused() {
+      if (!iframe || player.querySelector('.paused')) return;
+
+      // If YouTube's own fullscreen is on, the cover would be outside it.
+      // Move fullscreen to our container (player + cover) instead.
+      if (document.fullscreenElement === iframe) {
+        document.exitFullscreen()
+          .then(() => player.requestFullscreen())
+          .catch(() => {});
+      }
+
+      const panel = document.createElement('div');
+      panel.className = 'overlay paused';
+      panel.style.setProperty('--thumb', `url("https://i.ytimg.com/vi/${current.id}/hqdefault.jpg")`);
+      const at = lastTime ? `at ${fmt(lastTime)}${duration ? ' of ' + fmt(duration) : ''}` : '';
+      panel.innerHTML = `
+        <p class="title">Paused</p>
+        <p class="sub">${at}</p>
+        <div class="actions">
+          <button type="button" class="primary" data-act="resume">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15a1 1 0 0 0 1.5.86l12.5-7.5a1 1 0 0 0 0-1.72L8.5 3.64A1 1 0 0 0 7 4.5z"/></svg>
+            Resume
+          </button>
+          <button type="button" class="ghost" data-act="back">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+            10s
+          </button>
+        </div>`;
+      // Tapping anywhere on the cover resumes; the rewind button rewinds, then plays.
+      panel.addEventListener('click', e => {
+        if (e.target.closest('[data-act="back"]')) command('seekTo', [Math.max(0, lastTime - 10), true]);
+        command('playVideo');
+        hidePaused();
+      });
+      player.append(panel);
+      if (finePointer) panel.querySelector('[data-act="resume"]').focus({ preventScroll: true });
+    }
+
+    function hidePaused() {
+      player.querySelector('.paused')?.remove();
+    }
+
+    function fmt(sec) {
+      sec = Math.floor(sec);
+      const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
+      const mm = h ? String(m).padStart(2, '0') : m;
+      return (h ? h + ':' : '') + mm + ':' + String(s).padStart(2, '0');
+    }
 
     function showEnded() {
       if (!current || player.querySelector('.ended')) return;
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+      iframe = null;
       const panel = document.createElement('div');
-      panel.className = 'ended';
+      panel.className = 'overlay ended';
       panel.innerHTML = `
         <p class="title">Video finished</p>
         <p class="sub">Nice. What's next?</p>
@@ -676,6 +774,7 @@
         load({ id, start: parseTime(q.get('t')) }, { autoplay: false, push: false });
       } else {
         current = null;
+        iframe = null;
         stage.hidden = true;
         empty.hidden = false;
         player.replaceChildren();
